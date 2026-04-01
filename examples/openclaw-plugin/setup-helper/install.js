@@ -728,29 +728,109 @@ async function detectOpenClawVersion() {
   return "0.0.0";
 }
 
-// Try to fetch a URL, return response text or null
-async function tryFetch(url, timeout = 15000) {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
-    const response = await fetch(url, { signal: controller.signal });
-    clearTimeout(timeoutId);
-    if (response.ok) {
-      return await response.text();
-    }
-  } catch {}
-  return null;
+function getGitHubApiHeaders() {
+  return {
+    Accept: "application/vnd.github+json",
+    "User-Agent": "openviking-setup-helper",
+    "X-GitHub-Api-Version": "2022-11-28",
+  };
 }
 
-// Check if a remote file exists
-async function testRemoteFile(url) {
+async function fetchWithTimeout(url, options = {}, timeout = 15000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-    const response = await fetch(url, { method: "HEAD", signal: controller.signal });
+    const response = await fetch(url, { ...options, signal: controller.signal });
     clearTimeout(timeoutId);
-    return response.ok;
-  } catch {}
+    return response;
+  } catch {
+    clearTimeout(timeoutId);
+    return null;
+  }
+}
+
+function buildGitHubRawUrl(ref, repoPath) {
+  return `https://raw.githubusercontent.com/${REPO}/${ref}/${repoPath}`;
+}
+
+function buildGitHubContentsApiUrl(ref, repoPath) {
+  return `https://api.github.com/repos/${REPO}/contents/${repoPath}?ref=${encodeURIComponent(ref)}`;
+}
+
+let warnedGitHubApiFallback = false;
+
+function warnGitHubApiFallback(reason) {
+  if (warnedGitHubApiFallback) {
+    return;
+  }
+  warnedGitHubApiFallback = true;
+  warn(tr(
+    `raw.githubusercontent.com is unavailable${reason ? ` (${reason})` : ""}; falling back to the GitHub Contents API.`,
+    `raw.githubusercontent.com 当前不可用${reason ? `（${reason}）` : ""}；正在回退到 GitHub Contents API。`,
+  ));
+}
+
+async function fetchGitHubFileBuffer(ref, repoPath, timeout = 15000) {
+  const rawUrl = buildGitHubRawUrl(ref, repoPath);
+  const rawResponse = await fetchWithTimeout(rawUrl, {}, timeout);
+  let rawStatus = 0;
+
+  if (rawResponse) {
+    rawStatus = rawResponse.status;
+    if (rawResponse.ok) {
+      const buffer = Buffer.from(await rawResponse.arrayBuffer());
+      if (buffer.length > 0) {
+        return { ok: true, buffer, status: rawResponse.status, url: rawUrl };
+      }
+      rawStatus = 0;
+    }
+  }
+
+  const apiUrl = buildGitHubContentsApiUrl(ref, repoPath);
+  const apiResponse = await fetchWithTimeout(apiUrl, { headers: getGitHubApiHeaders() }, timeout);
+  if (!apiResponse?.ok) {
+    return { ok: false, buffer: null, status: apiResponse?.status || rawStatus || 0, url: apiUrl };
+  }
+
+  const payload = await apiResponse.json().catch(() => null);
+  const encodedContent = typeof payload?.content === "string" ? payload.content.replace(/\n/g, "") : "";
+  if (!encodedContent) {
+    return { ok: false, buffer: null, status: apiResponse.status || rawStatus || 0, url: apiUrl };
+  }
+
+  warnGitHubApiFallback(rawStatus ? `HTTP ${rawStatus}` : "network error");
+
+  const encoding = String(payload?.encoding || "").toLowerCase();
+  const buffer = encoding === "base64"
+    ? Buffer.from(encodedContent, "base64")
+    : Buffer.from(encodedContent, "utf8");
+
+  return { ok: buffer.length > 0, buffer, status: apiResponse.status, url: apiUrl };
+}
+
+async function tryFetchGitHubText(ref, repoPath, timeout = 15000) {
+  const result = await fetchGitHubFileBuffer(ref, repoPath, timeout);
+  if (!result.ok || !result.buffer || result.buffer.length === 0) {
+    return null;
+  }
+  return result.buffer.toString("utf8");
+}
+
+async function testGitHubFile(ref, repoPath, timeout = 10000) {
+  const rawResponse = await fetchWithTimeout(buildGitHubRawUrl(ref, repoPath), { method: "HEAD" }, timeout);
+  if (rawResponse?.ok) {
+    return true;
+  }
+
+  const apiResponse = await fetchWithTimeout(
+    buildGitHubContentsApiUrl(ref, repoPath),
+    { headers: getGitHubApiHeaders() },
+    timeout,
+  );
+  if (apiResponse?.ok) {
+    warnGitHubApiFallback(rawResponse ? `HTTP ${rawResponse.status}` : "network error");
+    return true;
+  }
   return false;
 }
 
@@ -804,11 +884,7 @@ async function resolveDefaultPluginVersion() {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
     const response = await fetch(apiUrl, {
-      headers: {
-        Accept: "application/vnd.github+json",
-        "User-Agent": "openviking-setup-helper",
-        "X-GitHub-Api-Version": "2022-11-28",
-      },
+      headers: getGitHubApiHeaders(),
       signal: controller.signal,
     });
     clearTimeout(timeoutId);
@@ -872,15 +948,13 @@ async function resolveDefaultPluginVersion() {
 
 // Resolve plugin configuration from manifest or fallback
 async function resolvePluginConfig() {
-  const ghRaw = `https://raw.githubusercontent.com/${REPO}/${PLUGIN_VERSION}`;
-
   info(tr(`Resolving plugin configuration for version: ${PLUGIN_VERSION}`, `正在解析插件配置，版本: ${PLUGIN_VERSION}`));
 
   let pluginDir = "";
   let manifestData = null;
 
   // Try to detect plugin directory and download manifest
-  const manifestCurrent = await tryFetch(`${ghRaw}/examples/openclaw-plugin/install-manifest.json`);
+  const manifestCurrent = await tryFetchGitHubText(PLUGIN_VERSION, "examples/openclaw-plugin/install-manifest.json");
   if (manifestCurrent) {
     pluginDir = "openclaw-plugin";
     try {
@@ -888,17 +962,17 @@ async function resolvePluginConfig() {
     } catch {}
     info(tr("Found manifest in openclaw-plugin", "在 openclaw-plugin 中找到 manifest"));
   } else {
-    const manifestLegacy = await tryFetch(`${ghRaw}/examples/openclaw-memory-plugin/install-manifest.json`);
+    const manifestLegacy = await tryFetchGitHubText(PLUGIN_VERSION, "examples/openclaw-memory-plugin/install-manifest.json");
     if (manifestLegacy) {
       pluginDir = "openclaw-memory-plugin";
       try {
         manifestData = JSON.parse(manifestLegacy);
       } catch {}
       info(tr("Found manifest in openclaw-memory-plugin", "在 openclaw-memory-plugin 中找到 manifest"));
-    } else if (await testRemoteFile(`${ghRaw}/examples/openclaw-plugin/index.ts`)) {
+    } else if (await testGitHubFile(PLUGIN_VERSION, "examples/openclaw-plugin/index.ts")) {
       pluginDir = "openclaw-plugin";
       info(tr("No manifest found, using fallback for openclaw-plugin", "未找到 manifest，使用 openclaw-plugin 回退配置"));
-    } else if (await testRemoteFile(`${ghRaw}/examples/openclaw-memory-plugin/index.ts`)) {
+    } else if (await testGitHubFile(PLUGIN_VERSION, "examples/openclaw-memory-plugin/index.ts")) {
       pluginDir = "openclaw-memory-plugin";
       info(tr("No manifest found, using fallback for openclaw-memory-plugin", "未找到 manifest，使用 openclaw-memory-plugin 回退配置"));
     } else {
@@ -925,7 +999,7 @@ async function resolvePluginConfig() {
     let fallbackKey = pluginDir === "openclaw-memory-plugin" ? "legacy" : "current";
     let compatVer = "";
 
-    const pkgJson = await tryFetch(`${ghRaw}/examples/${pluginDir}/package.json`);
+    const pkgJson = await tryFetchGitHubText(PLUGIN_VERSION, `examples/${pluginDir}/package.json`);
     if (pkgJson) {
       try {
         const pkg = JSON.parse(pkgJson);
@@ -955,8 +1029,7 @@ async function resolvePluginConfig() {
 
     // If no compatVer from package.json, try main branch manifest
     if (!compatVer && PLUGIN_VERSION !== "main") {
-      const mainRaw = `https://raw.githubusercontent.com/${REPO}/main`;
-      const mainManifest = await tryFetch(`${mainRaw}/examples/openclaw-plugin/install-manifest.json`);
+      const mainManifest = await tryFetchGitHubText("main", "examples/openclaw-plugin/install-manifest.json");
       if (mainManifest) {
         try {
           const m = JSON.parse(mainManifest);
@@ -1811,9 +1884,11 @@ async function prepareStrongPluginUpgrade() {
   info(tr(`Upgrade audit file: ${getUpgradeAuditPath()}`, `升级审计文件: ${getUpgradeAuditPath()}`));
 }
 
-async function downloadPluginFile(destDir, fileName, url, required, index, total) {
+async function downloadPluginFile(destDir, fileName, required, index, total) {
   const maxRetries = 3;
   const destPath = join(destDir, fileName);
+  const repoPath = `examples/${resolvedPluginDir}/${fileName}`;
+  const displayUrl = buildGitHubRawUrl(PLUGIN_VERSION, repoPath);
 
   process.stdout.write(`  [${index}/${total}] ${fileName} `);
 
@@ -1821,25 +1896,17 @@ async function downloadPluginFile(destDir, fileName, url, required, index, total
   let saw404 = false;
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
-    try {
-      const response = await fetch(url);
-      lastStatus = response.status;
-      if (response.ok) {
-        const buffer = Buffer.from(await response.arrayBuffer());
-        if (buffer.length === 0) {
-          lastStatus = 0;
-        } else {
-          await mkdir(dirname(destPath), { recursive: true });
-          await writeFile(destPath, buffer);
-          console.log(" OK");
-          return;
-        }
-      } else if (!required && response.status === 404) {
-        saw404 = true;
-        break;
-      }
-    } catch {
-      lastStatus = 0;
+    const result = await fetchGitHubFileBuffer(PLUGIN_VERSION, repoPath, 15000);
+    lastStatus = result.status;
+    if (result.ok && result.buffer && result.buffer.length > 0) {
+      await mkdir(dirname(destPath), { recursive: true });
+      await writeFile(destPath, result.buffer);
+      console.log(" OK");
+      return;
+    }
+    if (!required && result.status === 404) {
+      saw404 = true;
+      break;
     }
 
     if (attempt < maxRetries) {
@@ -1862,21 +1929,19 @@ async function downloadPluginFile(destDir, fileName, url, required, index, total
     console.log("");
     err(
       tr(
-        `Optional file failed after ${maxRetries} retries (HTTP ${lastStatus || "network"}): ${url}`,
-        `可选文件已重试 ${maxRetries} 次仍失败（HTTP ${lastStatus || "网络错误"}）: ${url}`,
+        `Optional file failed after ${maxRetries} retries (HTTP ${lastStatus || "network"}): ${displayUrl}`,
+        `可选文件已重试 ${maxRetries} 次仍失败（HTTP ${lastStatus || "网络错误"}）: ${displayUrl}`,
       ),
     );
     process.exit(1);
   }
 
   console.log("");
-  err(tr(`Download failed after ${maxRetries} retries: ${url}`, `下载失败（已重试 ${maxRetries} 次）: ${url}`));
+  err(tr(`Download failed after ${maxRetries} retries: ${displayUrl}`, `下载失败（已重试 ${maxRetries} 次）: ${displayUrl}`));
   process.exit(1);
 }
 
 async function downloadPlugin(destDir) {
-  const ghRaw = `https://raw.githubusercontent.com/${REPO}/${PLUGIN_VERSION}`;
-  const pluginDir = resolvedPluginDir;
   const total = resolvedFilesRequired.length + resolvedFilesOptional.length;
 
   await mkdir(destDir, { recursive: true });
@@ -1888,16 +1953,14 @@ async function downloadPlugin(destDir) {
   for (const name of resolvedFilesRequired) {
     if (!name) continue;
     i++;
-    const url = `${ghRaw}/examples/${pluginDir}/${name}`;
-    await downloadPluginFile(destDir, name, url, true, i, total);
+    await downloadPluginFile(destDir, name, true, i, total);
   }
 
   // Download optional files
   for (const name of resolvedFilesOptional) {
     if (!name) continue;
     i++;
-    const url = `${ghRaw}/examples/${pluginDir}/${name}`;
-    await downloadPluginFile(destDir, name, url, false, i, total);
+    await downloadPluginFile(destDir, name, false, i, total);
   }
 
   // npm install
